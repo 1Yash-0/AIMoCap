@@ -1,4 +1,4 @@
-# aimocap — Browser-Based AI Motion Capture
+# AI Mo-Cap —> Browser-Based AI Motion Capture
 
 ## What Is This Project?
 
