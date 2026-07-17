@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual envs
+venv/
+.venv/
+env/
+
+# Project data (large, not tracked)
+data/
+models/
+outputs/
+*.npy
+*.npz
+
+# Rig / binary assets (download separately; see README)
+*.FBX
+*.fbx
+*.bvh
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Agent session metadata
+.zcode/
+
+# Render / debug artifacts
+*.mp4
+*.gif
+*.png
+*.jpg
+*.jpeg
+*.html
+
+# Scratch / one-off scripts (not part of the pipeline)
+scratch/
+_patch_neck.py
+debug_*.py
+dump_script.py
+temp_*.md
+out.txt
+short_prompt.txt
+prompt.md
+nul

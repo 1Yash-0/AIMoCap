@@ -1,0 +1,49 @@
+[project]
+name = "aimocap"
+version = "0.0.1"
+description = "Markerless multi-camera AI motion capture engine (Python research core)."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # GPU runtime. cigpose-onnx declares a plain `onnxruntime` dep, whose CPU-only
+    # wheel shadows the CUDA-enabled build on import. We force BOTH the onnxruntime
+    # namespace and onnxruntime-gpu to the same version (1.20.x — the last line
+    # built against CUDA 12; CUDA 13 has no pip wheels yet as of mid-2026), so the
+    # GPU build is what actually loads. The nvidia-*-cu12 packages provide the
+    # CUDA/cuDNN runtime DLLs that the CUDA EP links against on Windows.
+    "onnxruntime==1.20.1",
+    "onnxruntime-gpu==1.20.1",
+    "nvidia-cuda-runtime-cu12>=12.6",
+    "nvidia-cuda-nvrtc-cu12>=12.6",
+    "nvidia-cublas-cu12>=12.6",
+    "nvidia-cufft-cu12>=11.0",
+    "nvidia-cudnn-cu12>=9.8",
+    "cigpose-onnx[gpu]>=0.1.0",
+    # Audio demux for the sync stage — bundles a static ffmpeg binary so the
+    # environment is reproducible without a system ffmpeg install.
+    "imageio-ffmpeg>=0.5.1",
+    "opencv-python>=4.9.0",
+    "numpy>=1.26.0",
+    "scipy>=1.11.0",
+    "pillow>=10.0.0",
+    "matplotlib>=3.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+aimocap = "aimocap.cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["aimocap*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
