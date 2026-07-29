@@ -1,26 +1,13 @@
 import numpy as np
 
+from aimocap.data.wholebody_layout import COCO_ANCHORS, N_KEYPOINTS
 from aimocap.retarget.rig_topology import RigTopology
 from aimocap.retarget.spine_chain import distribute_spine_targets
 
 # COCO-WholeBody source indices that anchor each body region. These are the
 # ONLY fixed indices — they come from the pose model, not the rig, so they are
 # general across rigs. The rig-side mapping is derived at runtime.
-COCO = {
-    "pelvis_l": 11, "pelvis_r": 12,           # hips
-    "shoulder_l": 5, "shoulder_r": 6,
-    "elbow_l": 7, "elbow_r": 8,
-    "wrist_l": 9, "wrist_r": 10,
-    "knee_l": 13, "knee_r": 14,
-    "ankle_l": 15, "ankle_r": 16,
-    "nose": 0,
-    # COCO-WholeBody foot keypoints (17-22): big toe, small toe, heel per side.
-    # big_toe anchors the proxy toe_* joint (Manny ball_*) so the IK gets a
-    # measured foot orientation instead of a R_root-synthesized one.
-    "big_toe_l": 17, "big_toe_r": 20,
-    "small_toe_l": 18, "small_toe_r": 21,
-    "heel_l": 19, "heel_r": 22,
-}
+COCO = COCO_ANCHORS
 
 
 def extract_mocap_points(pts3d):
@@ -30,11 +17,22 @@ def extract_mocap_points(pts3d):
     (K >= 23) so the IK can constrain foot orientation from measurement, not
     from the pelvis root frame. When K < 23 (old 17-joint data), big_toe keys
     are absent and the IK falls back to R_root synthesis for the toe target.
+
+    Hand MCP keypoints (K >= 133) are available but NOT used for palm frame
+    (Gate 2 verdict: UNUSABLE). They are extracted here for potential future use
+    but are not wired into the IK constraints.
     """
     out = {}
     out["pelvis"] = (pts3d[..., COCO["pelvis_l"], :] + pts3d[..., COCO["pelvis_r"], :]) / 2.0
     out["neck"] = (pts3d[..., COCO["shoulder_l"], :] + pts3d[..., COCO["shoulder_r"], :]) / 2.0
     out["nose"] = pts3d[..., COCO["nose"], :]
+    # Face keypoints for Kabsch head orientation (need ≥5 joints in input).
+    has_face = pts3d.shape[-2] > COCO["right_ear"]   # >= 5 joints
+    if has_face:
+        out["left_eye"] = pts3d[..., COCO["left_eye"], :]
+        out["right_eye"] = pts3d[..., COCO["right_eye"], :]
+        out["left_ear"] = pts3d[..., COCO["left_ear"], :]
+        out["right_ear"] = pts3d[..., COCO["right_ear"], :]
     has_feet = pts3d.shape[-2] > COCO["big_toe_r"]   # >= 21 joints
     for side in ("l", "r"):
         out[f"shoulder_{side}"] = pts3d[..., COCO[f"shoulder_{side}"], :]
@@ -50,6 +48,18 @@ def extract_mocap_points(pts3d):
             # tells us whether the foot is flat (toe ~ heel height) or
             # dorsiflexed (toe above heel -> "on heels").
             out[f"heel_{side}"] = pts3d[..., COCO[f"heel_{side}"], :]
+
+    # Hand MCP keypoints — available in 133-point data (K >= 133)
+    # Gate 2 verdict: UNUSABLE for palm frame. Extracted but not wired to IK.
+    has_hands = pts3d.shape[-2] >= N_KEYPOINTS
+    if has_hands:
+        for side in ("l", "r"):
+            out[f"hand_wrist_{side}"] = pts3d[..., COCO[f"hand_wrist_{side}"], :]
+            out[f"hand_index_mcp_{side}"] = pts3d[..., COCO[f"hand_index_mcp_{side}"], :]
+            out[f"hand_middle_mcp_{side}"] = pts3d[..., COCO[f"hand_middle_mcp_{side}"], :]
+            out[f"hand_ring_mcp_{side}"] = pts3d[..., COCO[f"hand_ring_mcp_{side}"], :]
+            out[f"hand_pinky_mcp_{side}"] = pts3d[..., COCO[f"hand_pinky_mcp_{side}"], :]
+
     return out
 
 
@@ -71,7 +81,7 @@ class MocapSkeleton:
     """
 
     def __init__(self, sequence_pts3d, sequence_weights=None, fbx_skel=None,
-                 fbx_rig_path="Manny.FBX"):
+                 fbx_rig_path="Manny.FBX", confidence=None):
         if fbx_skel is None:
             from aimocap.retarget.fbx_rig import Skeleton
             fbx_skel = Skeleton(fbx_rig_path)
@@ -95,6 +105,12 @@ class MocapSkeleton:
 
         # Rest offsets + rest positions, scaled to actor bone lengths.
         self.rest_offsets, self.rest_t = self._build_rest()
+
+        # Per-joint confidence from triangulation (0-1).  The IK uses this
+        # to downweight noisy joints (e.g. right hip conf=0.08).  Shape
+        # is (F, K) where K = number of COCO keypoints in the input.
+        # When None, all joints get confidence 1.0 (backward-compatible).
+        self.confidence = confidence
 
     def _build_joint_order(self, spine_names):
         """Construct (joint_names, parents, coco_anchor, fbx_mapping).

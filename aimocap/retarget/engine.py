@@ -118,6 +118,7 @@ def retarget_to_fbx(
     solved_root = []
     solved_local_quats = []
     prev_x = None
+    prev_prev_x = None
     for f in range(num_frames):
         if f % 10 == 0:
             print(f"Solving Mocap Frame {f}/{num_frames}")
@@ -126,7 +127,11 @@ def retarget_to_fbx(
             measured,
             prev_x=prev_x,
             temporal_weight=0.03,
+            frame_idx=f,
+            prev_prev_x=prev_prev_x,
+            accel_weight=0.3,
         )
+        prev_prev_x = prev_x.copy() if prev_x is not None else None
         prev_x = x_opt
         root_t, local_quats = mocap_ik._state_to_local_rotations(x_opt)
         solved_root.append(root_t)

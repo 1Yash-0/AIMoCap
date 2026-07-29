@@ -15,7 +15,95 @@ from scipy.spatial.transform import Rotation
 
 def _normalize(v: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(v)
-    return v / n if n > 1e-12 else v.copy()
+    if n > 1e-12:
+        return v / n
+    # Return unit vector along +X as fallback for zero vectors
+    return np.array([1.0, 0.0, 0.0])
+
+
+def arm_frame(E_minus_S: np.ndarray, W_minus_E: np.ndarray,
+              sin_lo: float = 0.05, sin_hi: float = 0.9) -> tuple[np.ndarray | None, np.ndarray | None, float | None]:
+    """
+    Build an orthonormal frame from the arm triangle (shoulder->elbow->wrist).
+
+    Parameters
+    ----------
+    E_minus_S : elbow - shoulder  (upper arm vector)
+    W_minus_E : wrist - elbow     (forearm vector)
+    sin_lo, sin_hi : blend thresholds on sin(angle between upper and forearm)
+
+    Returns
+    -------
+    F : (3,3) orthonormal frame with columns [x_forward, y_up, z_lateral]
+        x = normalized(W-E) × normalized(E-S)  -> forward (palm normal)
+        y = normalized(E-S)                    -> up (along upper arm)
+        z = cross(y, x)                        -> lateral
+    sin_blend : float in [0,1] or None if degenerate/straight arm
+    angle_deg : twist angle in degrees (signed, + = pronation for right arm)
+    """
+    u = E_minus_S
+    f = W_minus_E
+    nu = np.linalg.norm(u)
+    nf = np.linalg.norm(f)
+    if nu < 1e-6 or nf < 1e-6:
+        return None, None, None
+    u = u / nu
+    f = f / nf
+    # cross = u × f  (forward when arm is straight)
+    cross = np.cross(u, f)
+    n_cross = np.linalg.norm(cross)
+    if n_cross < 1e-6:
+        return None, None, None
+    x = cross / n_cross          # forward (palm normal)
+    z = u                        # up along upper arm
+    y = np.cross(z, x)           # lateral
+    y = y / (np.linalg.norm(y) + 1e-12)
+    x = np.cross(y, z)           # re-orthogonalize
+    x = x / (np.linalg.norm(x) + 1e-12)
+    z = np.cross(x, y)
+    z = z / (np.linalg.norm(z) + 1e-12)
+    F = np.column_stack([x, y, z])  # columns = [x, y, z]
+    # twist angle: angle between rest lateral axis and current lateral axis projected onto forearm axis
+    # This is a simplified version; the actual twist is computed in mocap_ik.py
+    sin_blend = float(np.clip(n_cross, sin_lo, sin_hi))
+    return F, None, sin_blend
+
+
+def wrist_twist_from_arm_frame(
+    F_rest: np.ndarray, F_curr: np.ndarray, forearm_axis: np.ndarray
+) -> float:
+    """
+    Compute wrist twist angle (in radians) from rest and current arm frames.
+
+    The twist is the rotation about the forearm axis (forearm_axis) that maps
+    the rest frame's lateral axis to the current frame's lateral axis.
+    """
+    # Forearm axis must be normalized
+    axis = forearm_axis / (np.linalg.norm(forearm_axis) + 1e-9)
+    # Lateral axes (z columns in our frame convention)
+    z_rest = F_rest[:, 2]
+    z_curr = F_curr[:, 2]
+    # Project both onto plane perpendicular to forearm axis
+    z_rest_proj = z_rest - np.dot(z_rest, axis) * axis
+    z_curr_proj = z_curr - np.dot(z_curr, axis) * axis
+    nzr = np.linalg.norm(z_rest_proj)
+    nzc = np.linalg.norm(z_curr_proj)
+    if nzr < 1e-6 or nzc < 1e-6:
+        return 0.0
+    z_rest_proj = z_rest_proj / nzr
+    z_curr_proj = z_curr_proj / nzc
+    # Signed angle about forearm axis
+    cos_a = np.clip(np.dot(z_rest_proj, z_curr_proj), -1.0, 1.0)
+    sin_a = np.dot(np.cross(z_rest_proj, z_curr_proj), axis)
+    return np.arctan2(sin_a, cos_a)
+
+
+def _normalize(v: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(v)
+    if n > 1e-12:
+        return v / n
+    # Return unit vector along +X as fallback for zero vectors
+    return np.array([1.0, 0.0, 0.0])
 
 
 def constrained_rotation(
@@ -37,6 +125,10 @@ def constrained_rotation(
     """
     rest = _normalize(np.asarray(rest_dir, dtype=np.float64))
     desired = _normalize(np.asarray(desired_dir, dtype=np.float64))
+    
+    # If desired direction is zero/near-zero, no swing needed - return identity
+    if np.linalg.norm(desired) < 1e-12:
+        return Rotation.identity()
 
     # Swing: shortest rotation rest -> desired. align_vectors on a single vector
     # is well-defined and picks the minimal rotation (zero twist component).
@@ -74,3 +166,119 @@ def constrained_rotation(
     axis_angle = np.arctan2(np.dot(np.cross(sc_u, cd_u), desired), cos_a)
     twist = Rotation.from_rotvec(axis_angle * desired)
     return twist * swing
+
+
+# ── Swing-twist decomposition and clamping ───────────────────────────────
+
+def swing_twist_decompose(
+    q: Rotation, bone_axis: np.ndarray,
+) -> tuple[Rotation, Rotation]:
+    """Decompose rotation ``q`` into (swing, twist) around ``bone_axis``.
+
+    The twist component is the rotation about ``bone_axis``; the swing is
+    everything else.  ``q = swing * twist`` (swing applied first, then twist).
+
+    Args:
+        q:          the rotation to decompose.
+        bone_axis:  unit vector defining the bone's longitudinal axis
+                    (e.g. the rest direction of the bone in parent space).
+
+    Returns:
+        ``(swing, twist)`` — two ``Rotation`` objects whose product equals ``q``.
+    """
+    axis = _normalize(np.asarray(bone_axis, dtype=np.float64))
+    # scipy convention: as_quat() returns [x, y, z, w] (scalar last)
+    x, y, z, w = q.as_quat()
+    # Project the vector part onto the bone axis
+    proj = np.dot([x, y, z], axis) * axis
+    # Twist quaternion: [proj_x, proj_y, proj_z, w] (scalar last)
+    twist_quat = np.array([proj[0], proj[1], proj[2], w])
+    n = np.linalg.norm(twist_quat)
+    if n < 1e-12:
+        twist = Rotation.identity()
+    else:
+        twist_quat = twist_quat / n
+        twist = Rotation.from_quat(twist_quat)
+    swing = q * twist.inv()
+    return swing, twist
+
+
+def clamp_twist(
+    q: Rotation, bone_axis: np.ndarray, max_twist_deg: float,
+) -> Rotation:
+    """Clamp the twist component of ``q`` around ``bone_axis``.
+
+    Decomposes ``q`` into swing + twist, clamps the twist angle to
+    ``±max_twist_deg``, and reconstructs: ``q_clamped = swing * twist_clamped``.
+
+    Args:
+        q:              the rotation to clamp.
+        bone_axis:      unit vector defining the bone's longitudinal axis.
+        max_twist_deg:  maximum allowed twist angle in degrees.
+
+    Returns:
+        ``Rotation`` with twist clamped to ``±max_twist_deg``.
+    """
+    swing, twist = swing_twist_decompose(q, bone_axis)
+    # Twist is a rotation about bone_axis — extract its angle
+    twist_rotvec = twist.as_rotvec()
+    twist_angle = np.dot(twist_rotvec, bone_axis)  # signed angle
+    max_rad = np.deg2rad(max_twist_deg)
+    if abs(twist_angle) > max_rad:
+        twist_angle = np.clip(twist_angle, -max_rad, max_rad)
+        twist = Rotation.from_rotvec(twist_angle * bone_axis)
+    return swing * twist
+
+
+# ── Helpers for forearm roll recovery ───────────────────────────────────
+
+def signed_twist_angle(q: Rotation, axis: np.ndarray) -> float:
+    """Extract the signed twist angle (radians) of rotation ``q`` about ``axis``.
+
+    Uses the same swing-twist decomposition as ``clamp_twist``.
+    """
+    axis = _normalize(np.asarray(axis, dtype=np.float64))
+    swing, twist = swing_twist_decompose(q, axis)
+    # Twist is a pure rotation about axis; its rotvec is parallel to axis
+    twist_rv = twist.as_rotvec()
+    return float(np.dot(twist_rv, axis))
+
+
+def twist_rotation(axis: np.ndarray, angle_rad: float) -> Rotation:
+    """Construct a pure twist rotation about ``axis`` by ``angle_rad``."""
+    axis = _normalize(np.asarray(axis, dtype=np.float64))
+    return Rotation.from_rotvec(angle_rad * axis)
+
+
+# ── Twist-constrained bones and their limits ────────────────────────────
+# Joint name → max twist angle in degrees.
+# Hinge joints (knees, ankles) have near-zero twist; wrists allow some.
+# Shoulders and hips are ball joints — no twist constraint.
+# IMPORTANT: elbow_l/r are NOT constrained here because in the proxy skeleton
+# the elbow joint carries the forearm axial roll (there is no separate radius/
+# ulna roll bone). Constraining elbow twist to 5 deg would zero out the valid
+# forearm roll signal from the arm triangle.
+# Wrist twist limits are MOVED to AXIAL_LIMITS below to be enforced via the
+# forearm roll residual instead of a per-frame clamp, which allows temporal
+# continuity (no per-frame 90° hard clamp).
+TWIST_LIMITS: dict[str, float] = {
+    "knee_l": 5.0, "knee_r": 5.0,
+    "ankle_l": 10.0, "ankle_r": 10.0,
+    "clavicle_l": 15.0, "clavicle_r": 15.0,
+}
+
+
+# ── Axial limits for bones with dedicated twist DOFs (forearm pronation) ──
+# Each entry: bone_name -> (max_degrees, axis_source)
+# axis_source can be:
+#   "self"       = bone's own long axis (e.g., wrist)
+#   "child:X"    = child bone X's long axis (e.g., elbow uses wrist axis)
+# This allows the forearm axial roll to be clamped while keeping temporal
+# continuity via the residual (not a hard per-frame clamp).
+AXIAL_LIMITS: dict[str, tuple[float, str]] = {
+    "elbow_l": (100.0, "child:wrist_l"),  # forearm axis
+    "elbow_r": (100.0, "child:wrist_r"),
+    "wrist_l": (25.0, "self"),
+    "wrist_r": (25.0, "self"),
+}
+
