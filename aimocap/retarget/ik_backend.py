@@ -147,10 +147,6 @@ def _solve_torch(solver, ctx: dict, x0: np.ndarray) -> np.ndarray:
         "temporal_weight": ctx["temporal_weight"],
         "init_weight": ctx["init_weight"],
         "limb_pinned_info": None,  # handled below
-        # Forearm roll targets (replaces wrist_targets)
-        "arm_roll_targets": ctx.get("arm_roll_targets", {}),
-        "forearm_roll_active": ctx.get("forearm_roll_active", {}),
-        "arm_rest_data": ctx.get("arm_rest_data", {}),
     }
 
     # Convert limb pinned info to torch tensors
@@ -163,26 +159,10 @@ def _solve_torch(solver, ctx: dict, x0: np.ndarray) -> np.ndarray:
             "p_parent": info["p_parent"],
             "twist_target": info.get("twist_target", 0.0),
             "twist_weight": info.get("twist_weight", 1.0),
-            "is_forearm_armroll": info.get("is_forearm_armroll", False),
-            "side": info.get("side", "r"),  # need to add side to limb_pinned_info
+            "side": info["side"] if "side" in info else None,
         } for info in limb_infos]
     else:
         torch_ctx["limb_pinned_info"] = []
-
-    # Convert arm_rest_data to torch tensors
-    arm_rest_data = ctx.get("arm_rest_data", {})
-    if arm_rest_data:
-        torch_ctx["arm_rest_data"] = {}
-        for side, data in arm_rest_data.items():
-            if data:
-                torch_ctx["arm_rest_data"][side] = {
-                    "elbow_i": data.get("elbow_i"),
-                    "wrist_i": data.get("wrist_i"),
-                    "roll_axis_el": to_t(data.get("roll_axis_el")) if data.get("roll_axis_el") is not None else None,
-                    "roll_axis_wr": to_t(data.get("roll_axis_wr")) if data.get("roll_axis_wr") is not None else None,
-                }
-    else:
-        torch_ctx["arm_rest_data"] = {}
 
     # Convert wrist targets to torch tensors (legacy)
     wrist_targets = ctx.get("wrist_targets", {})

@@ -241,47 +241,7 @@ def _residuals_torch(
         else:
             parts.append(torch.zeros(B, 3, device=device, dtype=dtype))
 
-        # Term 2b: Forearm roll from arm triangle
-        # Scalar residuals on elbow and wrist local twist about the forearm axis.
-        # The arm-plane roll phi is split 70/30 between elbow and wrist.
-        # Only constrains the axial component (twist), not the full quaternion.
-        arm_roll_targets = ctx.get("arm_roll_targets", {})
-        forearm_roll_active = ctx.get("forearm_roll_active", {})
-        arm_rest_data = ctx.get("arm_rest_data", {})
-        parents = ctx.get("parents")
-        if arm_roll_targets and parents is not None:
-            for side in ("l", "r"):
-                if not forearm_roll_active.get(side, False):
-                    continue
-                targets = arm_roll_targets.get(side, {})
-                if not targets.get("valid"):
-                    continue
-                rest = arm_rest_data.get(side, {})
-                if not rest:
-                    continue
-                # Elbow local twist
-                el_i = rest.get("elbow_i")
-                roll_axis_el = rest.get("roll_axis_el")
-                if el_i is not None and roll_axis_el is not None:
-                    p_el = parents[el_i].item()
-                    R_el_parent = grot[:, p_el, :]   # (B, 4)
-                    R_el_local = _quat_mul(_quat_inv(R_el_parent), grot[:, el_i, :])  # (B, 4)
-                    # Extract twist angle about roll_axis_el
-                    axis_el = torch.tensor(roll_axis_el, device=device, dtype=dtype).unsqueeze(0).expand(B, -1)
-                    twist_el = _extract_twist_angle_torch(R_el_local, axis_el)
-                    r_el = (twist_el - targets["phi_el"]) * ow
-                    parts.append(r_el.unsqueeze(-1))
-                # Wrist local twist
-                wr_i = rest.get("wrist_i")
-                roll_axis_wr = rest.get("roll_axis_wr")
-                if wr_i is not None and roll_axis_wr is not None:
-                    p_wr = parents[wr_i].item()
-                    R_wr_parent = grot[:, p_wr, :]   # (B, 4)
-                    R_wr_local = _quat_mul(_quat_inv(R_wr_parent), grot[:, wr_i, :])  # (B, 4)
-                    axis_wr = torch.tensor(roll_axis_wr, device=device, dtype=dtype).unsqueeze(0).expand(B, -1)
-                    twist_wr = _extract_twist_angle_torch(R_wr_local, axis_wr)
-                    r_wr = (twist_wr - targets["phi_wr"]) * ow * 0.6
-                    parts.append(r_wr.unsqueeze(-1))
+        # Term 3: Pelvis-neck lateral sway
         pelvis_i = ctx["pelvis_idx"]
         neck_i_s = ctx["neck_idx"]
         lat_axis = ctx["lat_axis"]               # (3,)
@@ -303,7 +263,6 @@ def _residuals_torch(
         # Term 5: Limb twist
         if ctx["limb_pinned_info"] is not None and len(ctx["limb_pinned_info"]) > 0:
             limb_res_list = []
-            arm_roll_targets = ctx.get("arm_roll_targets", {})
             for info in ctx["limb_pinned_info"]:
                 p_idx = info["p"]           # parent proxy idx
                 c_idx = info["c"]           # child proxy idx
@@ -311,7 +270,6 @@ def _residuals_torch(
                 p_parent = info["p_parent"] # parent of parent
                 twist_target = info.get("twist_target", 0.0)
                 twist_weight = info.get("twist_weight", 1.0)
-                is_forearm_armroll = info.get("is_forearm_armroll", False)
                 
                 # R_current = global_rots[p_parent].inv() * global_rots[p]
                 R_pp = grot[:, p_parent, :]
@@ -319,14 +277,6 @@ def _residuals_torch(
                 R_current = _quat_mul(_quat_inv(R_pp), R_p)
                 rv = _quat_to_rotvec(R_current)    # (B, 3)
                 twist_rad = (rv * bone).sum(dim=-1)  # (B,)
-                
-                if is_forearm_armroll:
-                    # Use arm roll target for this side
-                    side = info.get("side", "r")  # Need to add side to limb_pinned_info
-                    arm_targets = arm_roll_targets.get(side, {})
-                    if arm_targets.get("valid", False):
-                        twist_target = arm_targets.get("phi_sh", 0.0)
-                        twist_weight = arm_targets.get("weight", 1.0)
                 
                 twist_error = (twist_rad - twist_target) * twist_weight
                 limb_res_list.append(twist_error.unsqueeze(-1) * bone)  # (B, 3)

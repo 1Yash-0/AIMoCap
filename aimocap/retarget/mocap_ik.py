@@ -44,38 +44,6 @@ class MocapIKSolver:
                     self._twist_joint_indices[jname] = ji
                     self._twist_bone_axes[jname] = axis
 
-        # ── Rest arm frames for forearm roll recovery ──────────────────
-        # Precompute per-side rest arm frame (from rest_offsets) and forearm roll axis.
-        # The roll axis is the forearm rest direction in elbow local space.
-        from aimocap.retarget.swing_twist import arm_frame as _arm_frame
-        self._arm_rest = {}  # side -> {"F_rest", "n_rest", "elbow_i", "wrist_i", "roll_axis_el", "roll_axis_wr"}
-        for side in ("l", "r"):
-            sh_name = f"shoulder_{side}"
-            el_name = f"elbow_{side}"
-            wr_name = f"wrist_{side}"
-            if all(n in skel.name_to_idx for n in (sh_name, el_name, wr_name)):
-                sh_i = skel.name_to_idx[sh_name]
-                el_i = skel.name_to_idx[el_name]
-                wr_i = skel.name_to_idx[wr_name]
-                u0 = skel.rest_t[el_i] - skel.rest_t[sh_i]   # upper arm
-                f0 = skel.rest_t[wr_i] - skel.rest_t[el_i]   # forearm
-                F_rest, _, sin_bend_rest = _arm_frame(u0, f0)
-                if F_rest is not None and sin_bend_rest is not None:
-                    # Rest arm plane normal (n = lateral in frame convention)
-                    n_rest = F_rest[:, 1].copy()
-                    # Roll axis for elbow local: forearm rest direction in elbow space
-                    roll_axis_el = f0 / (np.linalg.norm(f0) + 1e-9)
-                    # Roll axis for wrist local: same physical axis in wrist space
-                    roll_axis_wr = f0 / (np.linalg.norm(f0) + 1e-9)
-                    self._arm_rest[side] = {
-                        "F_rest": F_rest,
-                        "n_rest": n_rest,
-                        "elbow_i": el_i,
-                        "wrist_i": wr_i,
-                        "roll_axis_el": roll_axis_el,
-                        "roll_axis_wr": roll_axis_wr,
-                        "sin_bend_rest": sin_bend_rest,
-                    }
 
         # ── Rest head frame for frame-based head orientation ──────────
         # Built from clavicle positions (rig-agnostic). Left-handed formula
@@ -367,55 +335,7 @@ class MocapIKSolver:
                 continue
                 
             desired_pl = global_rot[p_parent].inv().apply(desired_world)
-            
-            # The roll child must be a child of j, to pin the rotation of p!
-            # e.g., if p is thigh, j is calf, rc is foot.
-            rig_name_j = self.skel.fbx_mapping[j]
-            rc_name = self.skel.topo.roll_child(rig_name_j)
-            if rc_name is not None and rc_name in self.skel.fbx_mapping.values():
-                rc_proxy = next(idx for idx, rn in self.skel.fbx_mapping.items() if rn == rc_name)
-                # Only use the roll child as a twist constraint when BOTH:
-                #  (a) its target is a real MEASUREMENT (not synthesized from
-                #      R_root -- e.g. 17-joint data has no big_toe, so toe_l is
-                #      synthesized; twisting to match an R_root-derived target
-                #      is circular and injects garbage roll, the "caved-in"
-                #      calf), AND
-                #  (b) it has proxy children (it's an intermediate joint, not a
-                #      chain-end leaf).  A chain-end roll child (e.g. the wrist
-                #      for the forearm) has its position fully determined by
-                #      the chain geometry, so it carries no INDEPENDENT roll
-                #      information -- using it as a roll constraint produces
-                #      large spurious twists when the limb is bent (the
-                #      "hands rotated wrongly" artifact).  An intermediate roll
-                #      child (e.g. ankle for the shin, elbow for the upper arm)
-                #      has children beyond it, so its position genuinely
-                #      constrains the parent's roll.
-                # When either condition fails, skip the twist constraint:
-                # constrained_rotation returns swing-only, leaving the bone's
-                # long-axis twist at zero (identity).
-                rc_children = [c for c in range(self.num_joints)
-                               if self.parents[c] == rc_proxy]
-                rc_coco = self.skel.coco_anchor.get(rc_proxy)
-                rc_measured = (rc_coco is not None
-                               and rc_coco in measured
-                               and np.all(np.isfinite(measured[rc_coco]))
-                               and np.linalg.norm(measured[rc_coco]) > 1e-5)
-                if rc_measured and rc_children:
-                    roll_rest = self.skel.rest_offsets[rc_proxy]
-                    roll_des_world = target_pos[rc_proxy] - target_pos[j]
-                    # Skip roll child if desired direction is degenerate (zero norm)
-                    if np.linalg.norm(roll_des_world) > 1e-5:
-                        # transform roll_des into parent's rest frame, just like desired_world
-                        roll_des = global_rot[p_parent].inv().apply(roll_des_world)
-                    else:
-                        roll_rest = None
-                        roll_des = None
-                else:
-                    roll_rest = None; roll_des = None
-            else:
-                roll_rest = None; roll_des = None
-                
-            R_local = constrained_rotation(rest_off, desired_pl, roll_rest, roll_des)
+            R_local = constrained_rotation(rest_off, desired_pl)
             local_quats[p] = R_local.as_quat()
             global_rot[p] = global_rot[p_parent] * R_local
 
@@ -538,161 +458,7 @@ class MocapIKSolver:
         x[3:] = rotvecs.flatten()
         return x
 
-    def _compute_arm_roll_targets(self, measured: dict, frame_idx: int = 0) -> dict:
-        """Compute per-frame forearm roll targets from arm triangle.
-        
-        Returns dict with per-side entries containing phi_el, phi_wr, valid, weight,
-        plus the indices needed for residuals.
-        """
-        from aimocap.retarget.swing_twist import arm_frame
-        ALPHA = 0.7
-        targets = {}
-        for side in ("l", "r"):
-            arm_data = self._arm_rest.get(side)
-            sh_name = f"shoulder_{side}"
-            el_name = f"elbow_{side}"
-            wr_name = f"wrist_{side}"
-            if not arm_data or not all(n in self.skel.name_to_idx for n in (sh_name, el_name, wr_name)):
-                targets[side] = {"valid": False}
-                continue
-            sh_pos = measured.get(sh_name)
-            el_pos = measured.get(el_name)
-            wr_pos = measured.get(wr_name)
-            if not (sh_pos is not None and el_pos is not None and wr_pos is not None
-                    and np.all(np.isfinite(sh_pos)) and np.all(np.isfinite(el_pos))
-                    and np.all(np.isfinite(wr_pos))):
-                targets[side] = {"valid": False}
-                continue
-            u = el_pos - sh_pos
-            f = wr_pos - el_pos
-            F_curr, _, sin_bend = arm_frame(u, f)
-            if F_curr is None or sin_bend is None or sin_bend < 0.26:
-                targets[side] = {"valid": False}
-                continue
-            f0 = f / (np.linalg.norm(f) + 1e-9)
-            f0_rest = arm_data["roll_axis_wr"]
-            R_swing_fore = Rotation.align_vectors(f0.reshape(1, 3), f0_rest.reshape(1, 3))[0]
-            n_sw = R_swing_fore.apply(arm_data["n_rest"])
-            n_obs = F_curr[:, 1]
-            x_obs = f0
-            cross_n = np.cross(n_sw, n_obs)
-            dot_n = np.dot(n_sw, n_obs)
-            phi = float(np.arctan2(np.dot(cross_n, x_obs), dot_n))
-            if abs(phi) > np.deg2rad(120):
-                targets[side] = {"valid": False}
-                continue
-            # Confidence weight from triangulation
-            weight = 1.0
-            if self.skel.confidence is not None and frame_idx < self.skel.confidence.shape[0]:
-                conf_vals = []
-                for k in (f"shoulder_{side}", f"elbow_{side}", f"wrist_{side}"):
-                    coco_idx = self.skel.coco_anchor.get(self.skel.name_to_idx[k])
-                    if coco_idx is not None and coco_idx in COCO:
-                        c = self.skel.confidence[frame_idx, COCO[coco_idx]]
-                        if np.isfinite(c) and c > 0.05:
-                            conf_vals.append(c)
-                if conf_vals:
-                    weight = float(np.clip(np.prod(conf_vals) ** (1.0 / len(conf_vals)), 0.1, 1.0))
-            targets[side] = {
-                "phi_sh": phi,      # full roll applied to shoulder (upper arm)
-                "valid": True,
-                "weight": weight,
-                "elbow_i": arm_data["elbow_i"],
-                "wrist_i": arm_data["wrist_i"],
-                "roll_axis_el": arm_data["roll_axis_el"],
-                "roll_axis_wr": arm_data["roll_axis_wr"],
-            }
-        return targets
 
-    def _compute_shoulder_roll_targets(self, measured: dict, frame_idx: int = 0) -> dict:
-        """Compute per-frame shoulder roll targets from arm triangle.
-        
-        The arm triangle (shoulder-elbow-wrist) determines the arm plane,
-        which constrains UPPER-ARM axial roll (shoulder_* orientation).
-        This is the CORRECT use of the arm triangle — it constrains the
-        upper arm's axial roll, not forearm pronation or palm orientation.
-        
-        Returns dict with per-side entries containing target_local_quat,
-        valid, weight, and shoulder_i for residuals.
-        """
-        from aimocap.retarget.swing_twist import arm_frame
-        targets = {}
-        for side in ("l", "r"):
-            arm_data = self._arm_rest.get(side)
-            sh_name = f"shoulder_{side}"
-            el_name = f"elbow_{side}"
-            wr_name = f"wrist_{side}"
-            if not arm_data or not all(n in self.skel.name_to_idx for n in (sh_name, el_name, wr_name)):
-                targets[side] = {"valid": False}
-                continue
-            sh_pos = measured.get(sh_name)
-            el_pos = measured.get(el_name)
-            wr_pos = measured.get(wr_name)
-            if not (sh_pos is not None and el_pos is not None and wr_pos is not None
-                    and np.all(np.isfinite(sh_pos)) and np.all(np.isfinite(el_pos))
-                    and np.all(np.isfinite(wr_pos))):
-                targets[side] = {"valid": False}
-                continue
-            
-            # Build observed arm plane vectors in clavicle parent frame
-            clav_name = f"clavicle_{side}"
-            if clav_name not in self.skel.name_to_idx:
-                targets[side] = {"valid": False}
-                continue
-            clav_i = self.skel.name_to_idx[clav_name]
-            clav_parent = self.parents[clav_i]
-            
-            # We need the clavicle parent's global rotation to transform
-            # This is computed in _precompute_frame which runs before this
-            # So we'll compute the target in world space and transform in residuals
-            
-            # Compute observed arm plane
-            upper_obs = el_pos - sh_pos
-            fore_obs = wr_pos - el_pos
-            u = upper_obs / (np.linalg.norm(upper_obs) + 1e-9)
-            f = fore_obs / (np.linalg.norm(fore_obs) + 1e-9)
-            bend_sin = np.linalg.norm(np.cross(u, f))
-            if bend_sin < np.sin(np.deg2rad(15)):
-                targets[side] = {"valid": False}
-                continue
-            
-            # Compute the target shoulder local rotation using constrained_rotation
-            # with wrist as roll child
-            sh_i = self.skel.name_to_idx[f"shoulder_{side}"]
-            el_i = self.skel.name_to_idx[f"elbow_{side}"]
-            wr_i = self.skel.name_to_idx[f"wrist_{side}"]
-            upper_rest = self.skel.rest_offsets[el_i]
-            fore_rest = self.skel.rest_offsets[wr_i]
-            
-            # Transform observed vectors to clavicle parent frame
-            # We'll do this in the residual; here just store the target
-            # The actual target_local_quat will be computed in the residual
-            # where we have access to global_rots
-            
-            # Confidence weight
-            weight = 1.0
-            if self.skel.confidence is not None and hasattr(self.skel.confidence, 'shape'):
-                if len(self.skel.confidence.shape) == 2 and self.skel.confidence.shape[0] > 0:
-                    conf_vals = []
-                    for k in (f"shoulder_{side}", f"elbow_{side}", f"wrist_{side}"):
-                        coco_idx = self.skel.coco_anchor.get(self.skel.name_to_idx.get(k, -1))
-                        if coco_idx is not None and coco_idx in COCO:
-                            if self.skel.confidence.shape[0] > 0:
-                                c = self.skel.confidence[min(len(self.skel.confidence)-1, 0), COCO[coco_idx]]
-                                if np.isfinite(c) and c > 0.05:
-                                    conf_vals.append(c)
-                    if conf_vals:
-                        weight = float(np.clip(np.prod(conf_vals) ** (1.0 / len(conf_vals)), 0.1, 1.0))
-            
-            targets[side] = {
-                "valid": True,
-                "weight": weight,
-                "shoulder_i": self.skel.name_to_idx[f"shoulder_{side}"],
-                "elbow_i": self.skel.name_to_idx[f"elbow_{side}"],
-                "wrist_i": self.skel.name_to_idx[f"wrist_{side}"],
-                "roll_axis_sh": self._arm_rest[side]["roll_axis_el"],  # upper arm axis in shoulder local
-            }
-        return targets
 
     def _precompute_frame(self, measured: dict, prev_x: np.ndarray = None,
                           temporal_weight: float = 0.03, init_x: np.ndarray = None,
@@ -878,70 +644,17 @@ class MocapIKSolver:
                                 np.dot(bone_dir / bn, rc_dir / rn), -1, 1)
                             rc_well_conditioned = np.degrees(
                                 np.arccos(cos_ang)) > 35.0
-                # Skip forearm (elbow->wrist) twist-zero penalty when arm roll
-                # target is active for this side — the arm roll residuals will
-                # constrain the twist instead of forcing it to zero.
-                if p_name == f"elbow_{side}" and c_name == f"wrist_{side}":
-                    arm_data = self._arm_rest.get(side)
-                    if arm_data:
-                        # We need to check if this frame has valid arm roll
-                        # Use a quick check here since we haven't called _compute_arm_roll_targets yet
-                        sh_name = f"shoulder_{side}"
-                        el_name = f"elbow_{side}"
-                        wr_name = f"wrist_{side}"
-                        sh_pos = measured.get(sh_name)
-                        el_pos = measured.get(el_name)
-                        wr_pos = measured.get(wr_name)
-                        if (sh_pos is not None and el_pos is not None and wr_pos is not None
-                                and np.all(np.isfinite(sh_pos)) and np.all(np.isfinite(el_pos))
-                                and np.all(np.isfinite(wr_pos))):
-                            u = el_pos - sh_pos
-                            f = wr_pos - el_pos
-                            from aimocap.retarget.swing_twist import arm_frame
-                            F_curr, _, sin_bend = arm_frame(u, f)
-                            if F_curr is not None and sin_bend is not None and sin_bend >= 0.26:
-                                # Arm is bent enough for roll to be observable
-                                continue
                 if rc_well_conditioned:
                     continue
                 rest_off = self.skel.rest_offsets[c]
                 bone = rest_off / (np.linalg.norm(rest_off) + 1e-12)
                 p_parent = int(self.parents[p])
                 
-                # Determine if this is a forearm (elbow->wrist) with arm roll target
-                # If so, we don't pin twist to zero; instead we use a target from arm triangle
-                is_forearm_with_armroll = False
-                armroll_target = 0.0
-                armroll_weight = 1.0
-                if p_name == f"elbow_{side}" and c_name == f"wrist_{side}":
-                    arm_data = self._arm_rest.get(side)
-                    if arm_data:
-                        # Check if arm roll is observable this frame
-                        sh_name = f"shoulder_{side}"
-                        el_name = f"elbow_{side}"
-                        wr_name = f"wrist_{side}"
-                        sh_pos = measured.get(sh_name)
-                        el_pos = measured.get(el_name)
-                        wr_pos = measured.get(wr_name)
-                        if (sh_pos is not None and el_pos is not None and wr_pos is not None
-                                and np.all(np.isfinite(sh_pos)) and np.all(np.isfinite(el_pos))
-                                and np.all(np.isfinite(wr_pos))):
-                            u = el_pos - sh_pos
-                            f = wr_pos - el_pos
-                            from aimocap.retarget.swing_twist import arm_frame
-                            F_curr, _, sin_bend = arm_frame(u, f)
-                            if F_curr is not None and sin_bend is not None and sin_bend >= 0.26:
-                                # Arm is bent enough for roll to be observable
-                                # Use arm roll target computed in _precompute_frame
-                                # We'll pass the target via ctx["arm_roll_targets"] later
-                                is_forearm_with_armroll = True
-                
                 limb_pinned_info.append({
                     "p": p, "c": c, "bone": bone, "p_parent": p_parent,
-                    "twist_target": 0.0,      # NEW: target twist about `bone` (radians)
-                    "twist_weight": 1.0,      # 0.0+full_weight == old zero-pin exactly
-                    "is_forearm_armroll": is_forearm_with_armroll,
-                    "side": side,              # needed for torch backend
+                    "twist_target": 0.0,
+                    "twist_weight": 1.0,
+                    "side": side,
                 })
 
         # ── Head orientation metadata ────────────────────────────────────
@@ -990,21 +703,6 @@ class MocapIKSolver:
         # Canonical head template (kept for backward compat).
         from aimocap.math.kabsch import CANONICAL_HEAD_TEMPLATE
 
-        # ── Shoulder roll targets from arm triangle ───────────────────────────────
-        # The arm triangle (shoulder-elbow-wrist) determines the arm plane,
-        # which constrains UPPER-ARM axial roll (shoulder_* orientation).
-        # This is the CORRECT use of the arm triangle — it constrains the
-        # upper arm's axial roll, not forearm pronation or palm orientation.
-        shoulder_roll_targets = self._compute_shoulder_roll_targets(measured, frame_idx)
-        shoulder_roll_active = {side: targets.get("valid", False) 
-                               for side, targets in shoulder_roll_targets.items()}
-
-        # ── Forearm roll targets from arm triangle ───────────────────────────
-        # The same arm triangle gives us the forearm pronation/supination target.
-        # This replaces the old "pin twist to zero" for elbow->wrist when
-        # the arm is bent enough to observe the roll.
-        arm_roll_targets = self._compute_arm_roll_targets(measured, frame_idx)
-
         return {
             "tgt_pos": tgt_pos,
             "w": w.copy(),
@@ -1029,9 +727,7 @@ class MocapIKSolver:
             "pelvis_idx": self.skel.name_to_idx.get("pelvis"),
             "head_rest_dir": self.skel.rest_offsets[head_i] if head_i is not None else None,
             "nose": measured.get("nose"),
-            # Frame-based head orientation target (precomputed per frame)
             "head_target_quat": head_target_quat,
-            # Kabsch head orientation data (disabled)
             "use_kabsch": use_kabsch,
             "face_kpts": face_kpts,
             "canonical_head": CANONICAL_HEAD_TEMPLATE,
@@ -1039,16 +735,9 @@ class MocapIKSolver:
             "rest_t0": self.skel.rest_t[0].copy(),
             "rest_offsets": self.rest_offsets.copy(),
             "parents": self.parents.copy(),
-            # Swing-twist twist clamping data
             "twist_limits": self._twist_limits,
             "twist_joint_indices": self._twist_joint_indices,
             "twist_bone_axes": self._twist_bone_axes,
-            # Shoulder roll targets from arm triangle (Stage 3)
-            "shoulder_roll_targets": shoulder_roll_targets,
-            "shoulder_roll_active": shoulder_roll_active,
-            # Forearm roll targets from arm triangle (Phase 4)
-            "arm_roll_targets": arm_roll_targets,
-            "arm_rest_data": self._arm_rest,
         }
 
     def _residuals_with_ctx(self, x: np.ndarray, ctx: dict) -> np.ndarray:
@@ -1172,7 +861,6 @@ class MocapIKSolver:
 
             # Limb twist
             limb_res = []
-            arm_roll_targets = ctx.get("arm_roll_targets", {})
             for info in ctx["limb_pinned_info"]:
                 p_parent = info["p_parent"]
                 p = info["p"]
@@ -1181,27 +869,8 @@ class MocapIKSolver:
                 rv = R_current.as_rotvec()
                 twist_rad = np.dot(rv, bone)
                 
-                # Use target twist if specified (for forearm with arm roll target)
                 twist_target = info.get("twist_target", 0.0)
                 twist_weight = info.get("twist_weight", 1.0)
-                
-                if info.get("is_forearm_armroll", False):
-                    # Use arm roll target for this side
-                    # The forearm is elbow->wrist, find side from joint name
-                    side = None
-                    # Look up the joint name to determine side
-                    for j_name, j_idx in self.skel.name_to_idx.items():
-                        if j_idx == p:
-                            if j_name.startswith("elbow_"):
-                                side = j_name.split("_")[1]
-                                break
-                    
-                    if side and side in arm_roll_targets:
-                        arm_targets = arm_roll_targets[side]
-                        if arm_targets.get("valid", False):
-                            # Use phi from arm_roll_targets as the twist target
-                            twist_target = arm_targets.get("phi_sh", 0.0)
-                            twist_weight = arm_targets.get("weight", 1.0)
                 
                 twist_error = (twist_rad - twist_target) * twist_weight
                 limb_res.append(np.array([twist_error * bone[i] for i in range(3)]))
