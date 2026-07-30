@@ -12,10 +12,23 @@ from aimocap.retarget.arm_orient import (
     unwrap_against,
     limit_step,
     clamp_deg,
+    replace_twist,
+    signed_twist_about,
+    rotation_angle_deg,
     Observation,
     BEND_GATE_LO_DEG,
     BEND_GATE_HI_DEG,
 )
+
+
+def test_twist_replacement_is_not_additive():
+    """An existing +60° twist replaced by -10° must become -10°."""
+    axis = np.array([0.0, 1.0, 0.0])
+    ref = np.array([1.0, 0.0, 0.0])
+    current = Rotation.from_rotvec(np.deg2rad(60.0) * axis)
+    corrected = replace_twist(current, axis, ref, np.deg2rad(-10.0))
+    assert abs(np.degrees(signed_twist_about(corrected, axis, ref)) + 10.0) < 1e-6
+    assert rotation_angle_deg(corrected, Rotation.from_rotvec(np.deg2rad(-10.0) * axis)) < 1e-6
 
 
 def make_synthetic_arm(bend_deg: float, humeral_roll_deg: float = 0.0,

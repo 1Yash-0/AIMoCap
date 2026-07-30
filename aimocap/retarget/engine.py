@@ -144,6 +144,9 @@ def retarget_to_fbx(
         solve_forearm_global,
         solve_hand_global_v2,
         resolve_bone_axis_parent_local,
+        validate_arm_observation,
+        rotation_angle_deg,
+        Observation,
     )
 
     proxy_rest_global = [Rotation.identity()] * mocap_ik.num_joints
@@ -188,8 +191,10 @@ def retarget_to_fbx(
         }
 
     def _globals_to_locals(mocap_ik, old_local_quats, replacements, solved_root):
-        _, global_q = mocap_ik.forward_kinematics(solved_root, old_local_quats)
-        global_rots = list(Rotation.from_quat(global_q))
+        before_pos, before_global_q = mocap_ik.forward_kinematics(
+            solved_root, old_local_quats
+        )
+        global_rots = list(Rotation.from_quat(before_global_q))
         
         for idx, G_new in replacements.items():
             global_rots[idx] = G_new
@@ -203,9 +208,28 @@ def retarget_to_fbx(
                 L = global_rots[p].inv() * global_rots[idx]
             new_local_quats[idx] = L.as_quat()
         
+        after_pos, after_global_q = mocap_ik.forward_kinematics(
+            solved_root, new_local_quats
+        )
+        position_delta = np.linalg.norm(after_pos - before_pos, axis=1)
+        assert np.max(position_delta) < 1e-9, (
+            f"Arm rewrite moved proxy joint by {np.max(position_delta):.3e} cm"
+        )
+        replaced = set(replacements)
+        for idx in range(mocap_ik.num_joints):
+            if idx in replaced:
+                continue
+            assert rotation_angle_deg(
+                Rotation.from_quat(before_global_q[idx]),
+                Rotation.from_quat(after_global_q[idx]),
+            ) < 1e-8, f"Non-arm global rotation changed at joint {idx}"
         return new_local_quats
 
-    phi_prev = {"l": 0.0, "r": 0.0}
+    arm_state = {
+        side: {"prev_upper_dir": None, "prev_fore_dir": None,
+               "prev_phi": 0.0, "invalid_run": 0}
+        for side in ("l", "r")
+    }
     arm_source_histogram = {}
     arm_phi_upper = {"l": [], "r": []}
     arm_phi_fore  = {"l": [], "r": []}
@@ -228,15 +252,16 @@ def retarget_to_fbx(
             fore_i  = meta["fore_i"]
             hand_i  = meta["hand_i"]
             
-            sh_w = mocap_target_pts[f"shoulder_{side}"][f]
-            el_w = mocap_target_pts[f"elbow_{side}"][f]
-            wr_w = mocap_target_pts[f"wrist_{side}"][f]
-            
-            if sh_w is None or el_w is None or wr_w is None:
+            raw_sh = mocap_target_pts[f"shoulder_{side}"][f]
+            raw_el = mocap_target_pts[f"elbow_{side}"][f]
+            raw_wr = mocap_target_pts[f"wrist_{side}"][f]
+            arm_obs, obs_gate = validate_arm_observation(
+                raw_sh, raw_el, raw_wr, arm_state[side]
+            )
+            if arm_obs is None:
+                arm_source_histogram[obs_gate] = arm_source_histogram.get(obs_gate, 0) + 1
                 continue
-            if not (np.all(np.isfinite(sh_w)) and np.all(np.isfinite(el_w))
-                    and np.all(np.isfinite(wr_w))):
-                continue
+            sh_w, el_w, wr_w = arm_obs
             
             D_parent = global_rots[clav_i] * meta["G_parent_rest"].inv()
             
@@ -247,16 +272,18 @@ def retarget_to_fbx(
                 e_fore_upper_local=meta["e_fore_upper_local"],
                 G_rest_upper=meta["G_rest_upper"],
                 sh_w=sh_w, el_w=el_w, wr_w=wr_w,
-                phi_prev=phi_prev[side],
+                phi_prev=arm_state[side]["prev_phi"],
                 G_upper_ik=global_rots[upper_i],
             )
             
-            G_fore, obs_fore = solve_forearm_global(
-                G_upper_w=G_upper,
-                G_rest_fore=meta["G_rest_fore"],
-                e_fore_loc=meta["e_fore_upper_local"],
-                el_w=el_w, wr_w=wr_w,
-                phi_prev=0.0,
+            # Preserve the solved forearm global rotation.  Recomputing it
+            # from every raw wrist direction moves the proxy wrist whenever
+            # triangulation noise differs from the IK pose.  The hand still
+            # inherits the forearm delta below, but receives no second
+            # independent orientation correction.
+            G_fore = global_rots[fore_i]
+            obs_fore = Observation(
+                0.0, True, 1.0, "ik_only", "preserve_ik_forearm"
             )
             
             G_hand = solve_hand_global_v2(
@@ -269,8 +296,8 @@ def retarget_to_fbx(
             replacements[fore_i]  = G_fore
             replacements[hand_i]  = G_hand
             
-            phi_prev[side] = obs_upper.value
-            src = obs_upper.source
+            arm_state[side]["prev_phi"] = obs_upper.value
+            src = obs_gate if obs_gate == "held" else obs_upper.source
             arm_source_histogram[src] = arm_source_histogram.get(src, 0) + 1
             arm_phi_upper[side].append(obs_upper.value)
             arm_phi_fore[side].append(obs_fore.value)
@@ -280,28 +307,6 @@ def retarget_to_fbx(
         
         new_local_quats = _globals_to_locals(
             mocap_ik, old_local_quats, replacements, solved_root[f]
-        )
-        
-        tracked_names = [
-            f"shoulder_{s}" for s in ("l", "r")
-        ] + [
-            f"elbow_{s}" for s in ("l", "r")
-        ]
-        tracked_idx = np.array([
-            mocap_skel.name_to_idx[n]
-            for n in tracked_names
-            if n in mocap_skel.name_to_idx
-        ])
-        
-        before_pos, _ = mocap_ik.forward_kinematics(solved_root[f], old_local_quats)
-        after_pos, _  = mocap_ik.forward_kinematics(solved_root[f], new_local_quats)
-        
-        max_delta = np.max(np.linalg.norm(
-            before_pos[tracked_idx] - after_pos[tracked_idx], axis=1
-        ))
-        assert max_delta < 1e-9, (
-            f"Frame {f}: arm rewrite moved shoulder/elbow by {max_delta:.3e} cm — "
-            "axial twist must be position-preserving"
         )
         
         solved_local_quats[f] = new_local_quats

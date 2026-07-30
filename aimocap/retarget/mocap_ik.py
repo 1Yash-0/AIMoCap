@@ -1,5 +1,11 @@
 import numpy as np
 from scipy.spatial.transform import Rotation
+
+
+# Face keypoints are not calibrated well enough to drive production head
+# orientation.  Keep the head neutral relative to the neck until a separate
+# calibrated head-frame task supplies a numeric confidence gate.
+HEAD_ORIENTATION_MODE = "neck_follow"
 from aimocap.retarget.mocap_skeleton import MocapSkeleton, COCO
 from aimocap.retarget.root_frame import root_rotation, spine_scale
 
@@ -352,7 +358,13 @@ class MocapIKSolver:
                     p_parent = self.parents[p]
                     rest_dir = self.skel.rest_offsets[p]
 
-                    # ── Frame-based head orientation ───────────────────────
+                    # ── Safe production head mode ─────────────────────────
+                    if p == self.skel.name_to_idx.get("head") and HEAD_ORIENTATION_MODE == "neck_follow":
+                        local_quats[p] = [0.0, 0.0, 0.0, 1.0]
+                        global_rot[p] = global_rot[p_parent]
+                        continue
+
+                    # ── Frame-based head orientation (diagnostic only) ─────
                     # Build an orthonormal head frame from face keypoints
                     # (ears for lateral, face midpoint for forward) and the
                     # rig's rest frame (clavicles for lateral). The delta
@@ -660,7 +672,8 @@ class MocapIKSolver:
         # ── Head orientation metadata ────────────────────────────────────
         head_i = self.skel.name_to_idx.get("head")
         neck_i = self.skel.name_to_idx.get("neck_01")
-        head_ori_active = (head_i is not None and neck_i is not None
+        head_ori_active = (HEAD_ORIENTATION_MODE != "neck_follow"
+                           and head_i is not None and neck_i is not None
                            and "nose" in measured
                            and head_i in self.skel.coco_anchor
                            and w[head_i] > 0.0)
@@ -677,7 +690,7 @@ class MocapIKSolver:
         # rest frame. This gives real head tracking (yaw/pitch/roll) from
         # data without Kabsch or nose-direction.
         head_target_quat = None
-        if head_ori_active and "left_ear" in face_kpts and "right_ear" in face_kpts:
+        if HEAD_ORIENTATION_MODE != "neck_follow" and head_ori_active and "left_ear" in face_kpts and "right_ear" in face_kpts:
             la = face_kpts["left_ear"]
             ra = face_kpts["right_ear"]
             face_pts = [face_kpts[k] for k in ("nose", "left_eye", "right_eye")

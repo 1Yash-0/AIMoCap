@@ -27,8 +27,11 @@ from scipy.spatial.transform import Rotation
 BEND_GATE_LO_DEG = 20.0       # below: humeral roll unobservable from arm triangle
 BEND_GATE_HI_DEG = 40.0       # above: fully trusted. Linear ramp between.
 HUMERAL_AXIAL_LIMIT_DEG = 90.0    # gleno-humeral internal/external ROM, hanging arm
-ROLL_MAX_STEP_DEG = 25.0     # continuity clamp, 30 fps human shoulder
+ROLL_MAX_STEP_DEG = 12.0     # continuity clamp, 30 fps human shoulder
 PROJ_DEGENERACY_MIN = 0.15   # reject signed-angle when projection collapses
+ARM_MIN_SEGMENT_CM = 5.0
+ARM_MAX_DIRECTION_STEP_DEG = 12.0
+ARM_HOLD_FRAMES = 3
 
 
 def unit(v: np.ndarray, name: str) -> np.ndarray:
@@ -131,6 +134,51 @@ def signed_angle_about(u_w: np.ndarray, v_w: np.ndarray, axis_w: np.ndarray
     return float(angle), True, "elbow_plane"
 
 
+def rotation_angle_deg(a: Rotation, b: Rotation) -> float:
+    """Shortest angular distance between two rotations, in degrees."""
+    return float(np.degrees((a * b.inv()).magnitude()))
+
+
+def project_perpendicular(v: np.ndarray, axis: np.ndarray) -> np.ndarray:
+    """Normalize the component of *v* perpendicular to *axis*."""
+    axis = unit(axis, "projection axis")
+    v = np.asarray(v, dtype=np.float64)
+    p = v - np.dot(v, axis) * axis
+    n = np.linalg.norm(p)
+    if n < PROJ_DEGENERACY_MIN * max(np.linalg.norm(v), 1e-12):
+        raise ValueError("degenerate perpendicular projection")
+    return p / n
+
+
+def signed_twist_about(
+    rotation_w: Rotation,
+    axis_w: np.ndarray,
+    reference_w: np.ndarray,
+) -> float:
+    """Extract the signed axial twist of ``rotation_w`` about ``axis_w``."""
+    axis_w = unit(axis_w, "twist axis")
+    ref = project_perpendicular(reference_w, axis_w)
+    moved = project_perpendicular(rotation_w.apply(ref), axis_w)
+    return float(np.arctan2(
+        np.dot(np.cross(ref, moved), axis_w),
+        np.dot(ref, moved),
+    ))
+
+
+def replace_twist(
+    rotation_w: Rotation,
+    axis_w: np.ndarray,
+    reference_w: np.ndarray,
+    target_twist_rad: float,
+) -> Rotation:
+    """Preserve swing while replacing, rather than adding, axial twist."""
+    axis_w = unit(axis_w, "replacement axis")
+    ref = project_perpendicular(reference_w, axis_w)
+    current_twist = signed_twist_about(rotation_w, axis_w, ref)
+    delta = target_twist_rad - current_twist
+    return Rotation.from_rotvec(delta * axis_w) * rotation_w
+
+
 def unwrap_against(phi: float, phi_prev: float) -> float:
     """Add k·2π to minimize |phi - phi_prev|."""
     diff = phi - phi_prev
@@ -175,6 +223,46 @@ class Observation:
                 f"valid={self.valid}, w={self.weight:.2f}, src={self.source})")
 
 
+def validate_arm_observation(
+    sh_w: np.ndarray,
+    el_w: np.ndarray,
+    wr_w: np.ndarray,
+    state: dict,
+) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray] | None, str]:
+    """Reject implausible one-frame direction spikes and hold briefly."""
+    pts = [np.asarray(v, dtype=np.float64) for v in (sh_w, el_w, wr_w)]
+    if not all(v.shape == (3,) and np.all(np.isfinite(v)) for v in pts):
+        state["invalid_run"] += 1
+        return (None, "ik_only" if state["invalid_run"] > ARM_HOLD_FRAMES else "none")
+    sh, el, wr = pts
+    upper_len = np.linalg.norm(el - sh)
+    fore_len = np.linalg.norm(wr - el)
+    if min(upper_len, fore_len) < ARM_MIN_SEGMENT_CM:
+        state["invalid_run"] += 1
+        return (None, "ik_only" if state["invalid_run"] > ARM_HOLD_FRAMES else "none")
+
+    upper_dir = (el - sh) / upper_len
+    fore_dir = (wr - el) / fore_len
+    def step_exceeded(new, old):
+        return old is not None and np.degrees(np.arccos(np.clip(np.dot(new, old), -1.0, 1.0))) > ARM_MAX_DIRECTION_STEP_DEG
+
+    spike = step_exceeded(upper_dir, state.get("prev_upper_dir")) or step_exceeded(
+        fore_dir, state.get("prev_fore_dir")
+    )
+    if spike:
+        state["invalid_run"] += 1
+        if state["invalid_run"] <= ARM_HOLD_FRAMES and state.get("prev_upper_dir") is not None:
+            held_el = sh + upper_len * state["prev_upper_dir"]
+            held_wr = held_el + fore_len * state["prev_fore_dir"]
+            return ((sh, held_el, held_wr), "held")
+        return (None, "ik_only")
+
+    state["invalid_run"] = 0
+    state["prev_upper_dir"] = upper_dir
+    state["prev_fore_dir"] = fore_dir
+    return ((sh, el, wr), "accepted")
+
+
 def solve_upperarm_global(
     *,
     D_parent: Rotation,            # world delta of clavicle from proxy rest
@@ -198,41 +286,67 @@ def solve_upperarm_global(
     
     Returns: (G_upper_w, Observation)
     """
+    axis_obs_w = unit(el_w - sh_w, "measured humerus")
+    axis_apply_w = axis_obs_w
     if G_upper_ik is not None:
         G_swing = G_upper_ik
-        a_obs_w = G_swing.apply(G_parent_rest.apply(unit(e_upper_parent, "upper rest axis")))
+        axis_ik_w = unit(
+            G_upper_ik.apply(G_parent_rest.apply(unit(e_upper_parent, "upper rest axis"))),
+            "IK humerus",
+        )
+        # The measured axis drives observability and target estimation, but
+        # the actual twist rewrite must use the IK bone axis.  That axis is
+        # exactly the parent-to-elbow proxy axis, so rotating around it cannot
+        # move the elbow proxy even when measured geometry is noisy.
+        axis_apply_w = axis_ik_w
+        axis_disagreement = rotation_angle_deg(
+            shortest_arc(axis_ik_w, axis_obs_w), Rotation.identity()
+        )
+        if axis_disagreement >= 25.0:
+            return G_swing, Observation(
+                0.0, False, 0.0, "none", "ik_axis_disagrees_with_observation"
+            )
     else:
         a_rest_w = D_parent.apply(G_parent_rest.apply(unit(e_upper_parent, "upper rest axis")))
-        a_obs_w = el_w - sh_w
-        a_obs_w = a_obs_w / (np.linalg.norm(a_obs_w) + 1e-12)
-        S = shortest_arc(a_rest_w, a_obs_w)
+        S = shortest_arc(a_rest_w, axis_obs_w)
         G_swing = S * D_parent * G_rest_upper
     
     # ROLL — conditional on elbow bend
-    f_obs_w = wr_w - el_w
-    f_obs_w = f_obs_w / (np.linalg.norm(f_obs_w) + 1e-12)
-    bend = np.degrees(np.arccos(np.clip(np.dot(a_obs_w, f_obs_w), -1.0, 1.0)))
-    
-    # Linear ramp from LO to HI
-    w = np.clip((bend - BEND_GATE_LO_DEG) / (BEND_GATE_HI_DEG - BEND_GATE_LO_DEG), 0.0, 1.0)
-    
-    if w <= 0.0:
-        return G_swing, Observation(0.0, True, 1.0, "swing_only", f"bend={bend:.1f}°")
-    
-    # Forearm direction IF shoulder only swung (no humeral roll)
-    f_carried_w = G_swing.apply(e_fore_upper_local)
-    
-    obs = signed_angle_about(f_carried_w, f_obs_w, a_obs_w)
-    if not obs[1]:  # not valid
-        return G_swing, Observation(0.0, False, 0.0, "none", obs[2])
-    
-    phi = obs[0]
-    phi = clamp_deg(phi, HUMERAL_AXIAL_LIMIT_DEG)
-    phi = limit_step(phi, phi_prev, ROLL_MAX_STEP_DEG)
-    
-    # Apply roll about the OBSERVED humerus axis
-    G = Rotation.from_rotvec(w * phi * a_obs_w) * G_swing
-    return G, Observation(phi, True, w, "elbow_plane", f"bend={bend:.1f}°")
+    f_obs_w = unit(wr_w - el_w, "measured forearm")
+    bend = np.degrees(np.arccos(np.clip(np.dot(axis_obs_w, f_obs_w), -1.0, 1.0)))
+    f_carried_w = G_swing.apply(unit(e_fore_upper_local, "forearm rest axis"))
+
+    if bend < BEND_GATE_LO_DEG:
+        target_phi = 0.0
+        source = "swing_only"
+        valid = True
+        reason = f"bend={bend:.1f}°"
+    else:
+        obs = signed_angle_about(f_carried_w, f_obs_w, axis_obs_w)
+        if not obs[1]:
+            return G_swing, Observation(0.0, False, 0.0, "none", obs[2])
+        measured_phi = clamp_deg(obs[0], HUMERAL_AXIAL_LIMIT_DEG)
+        if bend < BEND_GATE_HI_DEG:
+            # The transition is deliberately held, not linearly blended.
+            target_phi = phi_prev
+            source = "transition_rejected"
+            valid = False
+        else:
+            # A small scalar low-pass plus a hard per-frame gate suppresses
+            # triangulation spikes without touching the global temporal filter.
+            filtered_phi = 0.5 * phi_prev + 0.5 * measured_phi
+            target_phi = limit_step(filtered_phi, phi_prev, ROLL_MAX_STEP_DEG)
+            source = "elbow_plane"
+            valid = True
+        reason = f"bend={bend:.1f}°"
+
+    target_phi = limit_step(target_phi, phi_prev, ROLL_MAX_STEP_DEG)
+    target_phi = clamp_deg(target_phi, HUMERAL_AXIAL_LIMIT_DEG)
+    try:
+        G = replace_twist(G_swing, axis_apply_w, f_carried_w, target_phi)
+    except ValueError as exc:
+        return G_swing, Observation(0.0, False, 0.0, "none", str(exc))
+    return G, Observation(target_phi, valid, 1.0 if valid else 0.0, source, reason)
 
 
 def solve_forearm_global(
