@@ -366,6 +366,7 @@ def _cmd_retarget(args: argparse.Namespace) -> int:
         foot_lock=not args.disable_foot_lock,
         foot_lock_debug_dir=args.foot_lock_debug_dir,
         pose2d_npz=args.pose2d_npz,
+        arm_orientation_rewrite=args.enable_arm_orientation_rewrite,
     )
     return 0
 
@@ -481,6 +482,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--pose2d-npz",
         default=None,
         help="Optional multi-camera 2D pose NPZ for image-space foot contact detection.",
+    )
+    rp.add_argument(
+        "--enable-arm-orientation-rewrite",
+        action="store_true",
+        help=(
+            "Enable the experimental post-IK arm rewrite. Disabled by default "
+            "because the production solver must remain the single arm authority."
+        ),
     )
     rp.set_defaults(func=_cmd_retarget)
 

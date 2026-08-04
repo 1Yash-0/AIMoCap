@@ -134,6 +134,25 @@ def test_two_bone_knee_solver_preserves_lengths():
     assert np.isclose(np.linalg.norm(ankle_eff - knee_eff), 5.0)
 
 
+def test_nearest_euler_representation_is_continuous():
+    """Equivalent XYZ branches must not serialize as a 360-degree jump."""
+    from aimocap.retarget.bvh import _nearest_euler_xyz
+
+    previous = np.deg2rad([179.0, 10.0, -179.0])
+    rotation = Rotation.from_euler(
+        "XYZ", np.deg2rad([-179.0, 10.0, 179.0])
+    )
+    current = _nearest_euler_xyz(rotation, previous)
+    assert np.max(np.abs(np.degrees(current - previous))) < 10.0
+
+
+def test_neck_follow_head_mode_is_explicit():
+    """Production head orientation is neutral relative to its neck parent."""
+    from aimocap.retarget.mocap_ik import HEAD_ORIENTATION_MODE
+
+    assert HEAD_ORIENTATION_MODE == "neck_follow"
+
+
 def test_bvh_export_roundtrips_to_internal_fk(tmp_path):
     skel = Skeleton("Manny.FBX")
     frames = 6

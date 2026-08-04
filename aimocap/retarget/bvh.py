@@ -4,6 +4,35 @@ from scipy.spatial.transform import Rotation
 from aimocap.retarget.fbx_rig import Skeleton
 
 
+def _nearest_euler_xyz(
+    rotation: Rotation,
+    previous: np.ndarray | None,
+) -> np.ndarray:
+    """Return an equivalent XYZ Euler representation nearest ``previous``.
+
+    BVH stores Euler channels, so each frame must choose a continuous branch
+    explicitly.  The quaternion/FBX path remains unchanged.
+    """
+    base = rotation.as_euler("XYZ", degrees=False)
+    if previous is None:
+        return base
+
+    previous = np.asarray(previous, dtype=np.float64)
+    alternate = np.array(
+        [base[0] + np.pi, np.pi - base[1], base[2] + np.pi],
+        dtype=np.float64,
+    )
+    offsets = np.array([-1, 0, 1], dtype=np.float64) * (2.0 * np.pi)
+    candidates = [
+        branch + np.array([dx, dy, dz], dtype=np.float64)
+        for branch in (base, alternate)
+        for dx in offsets
+        for dy in offsets
+        for dz in offsets
+    ]
+    return min(candidates, key=lambda value: float(np.linalg.norm(value - previous)))
+
+
 def write_bvh(filepath: str, skel: Skeleton, animation_data: np.ndarray, fps: float = 30.0):
     """
     Export animation to BVH with standard Y-up right-handed convention.
@@ -97,6 +126,7 @@ def write_bvh(filepath: str, skel: Skeleton, animation_data: np.ndarray, fps: fl
         f.write(f"Frame Time: {1.0 / fps:.6f}\n")
 
         pelvis_rest_t = skel.rest_translations[pelvis_skel_idx]
+        previous_eulers: dict[int, np.ndarray] = {}
 
         for frame_data in animation_data:
             root_t = frame_data[0:3]
@@ -126,12 +156,18 @@ def write_bvh(filepath: str, skel: Skeleton, animation_data: np.ndarray, fps: fl
             for skel_idx in hierarchy_order:
                 if skel_idx == pelvis_skel_idx:
                     # Pelvis = combined root + pelvis rotation, converted to Y-up.
-                    euler_deg = R_pelvis_yup.as_euler("XYZ", degrees=True)
+                    euler_rad = _nearest_euler_xyz(
+                        R_pelvis_yup, previous_eulers.get(skel_idx)
+                    )
                 else:
                     # All other joints: conjugate local rotation by R_conv.
                     R_local = Rotation.from_euler("xyz", full_rots_rad[skel_idx])
                     R_local_yup = R_conv * R_local * R_conv_inv
-                    euler_deg = R_local_yup.as_euler("XYZ", degrees=True)
+                    euler_rad = _nearest_euler_xyz(
+                        R_local_yup, previous_eulers.get(skel_idx)
+                    )
+                previous_eulers[skel_idx] = euler_rad
+                euler_deg = np.degrees(euler_rad)
                 row.extend(euler_deg)
 
             f.write(" ".join(f"{val:.4f}" for val in row) + "\n")

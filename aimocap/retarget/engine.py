@@ -67,6 +67,7 @@ def retarget_to_fbx(
     foot_lock: bool = True,
     foot_lock_debug_dir: str | None = None,
     pose2d_npz: str | None = None,
+    arm_orientation_rewrite: bool = False,
 ):
     print(f"Loading triangulated data from {triangulated_npz}")
     triangulated_data = np.load(triangulated_npz)
@@ -137,8 +138,16 @@ def retarget_to_fbx(
         solved_root.append(root_t)
         solved_local_quats.append(local_quats)
 
-    # ── Stage 1b: Side-Agnostic Arm Orientation Rewrite ──────────────────────
-    print("Stage 1b: Arm orientation rewrite...")
+    # ── Stage 1b: Experimental post-IK arm orientation rewrite ──────────────
+    # This is deliberately opt-in.  The whole-body IK is the production
+    # authority for shoulder/elbow/wrist consistency; applying an independent
+    # global rewrite afterwards creates a second solver and can reintroduce
+    # jitter.  Keep it available for controlled experiments only.
+    print(
+        "Stage 1b: Arm orientation rewrite..."
+        if arm_orientation_rewrite
+        else "Stage 1b: Arm orientation rewrite disabled (IK-only production mode)."
+    )
     from aimocap.retarget.arm_orient import (
         solve_upperarm_global,
         solve_forearm_global,
@@ -189,6 +198,9 @@ def retarget_to_fbx(
             "G_rest_fore":   proxy_rest_global[fore_i],
             "G_rest_hand":   proxy_rest_global[hand_i],
         }
+
+    if not arm_orientation_rewrite:
+        arm_meta = {}
 
     def _globals_to_locals(mocap_ik, old_local_quats, replacements, solved_root):
         before_pos, before_global_q = mocap_ik.forward_kinematics(
@@ -336,6 +348,11 @@ def retarget_to_fbx(
     # Hip/knee roll is underdetermined from sparse 3D joints, but handled in IK now.
     
     fbx_animation = np.zeros((num_frames, 3 + fbx_skel.num_joints * 3))
+    previous_frame_local = None
+    rotation_diag_indices = {
+        name: fbx_skel.name_to_idx.get(name)
+        for name in ("head", "neck_01", "pelvis")
+    }
 
     for f in range(num_frames):
         mocap_pos, mocap_global_quats = mocap_ik.forward_kinematics(
@@ -378,6 +395,21 @@ def retarget_to_fbx(
         fbx_animation[f, 0:3] = root_world - fbx_skel.rest_translations[fbx_root_idx]
 
         frame_local_quats = np.array([r.as_quat() for r in frame_local])
+        if previous_frame_local is not None and f % 30 == 0:
+            dots = np.sum(previous_frame_local * frame_local_quats, axis=1)
+            delta_deg = np.degrees(2.0 * np.arccos(np.clip(np.abs(dots), -1.0, 1.0)))
+            values = {
+                name: (delta_deg[idx] if idx is not None else float("nan"))
+                for name, idx in rotation_diag_indices.items()
+            }
+            print(
+                "[rotation-diagnostic] "
+                f"frame={f} head_delta={values['head']:.2f}deg "
+                f"neck_delta={values['neck_01']:.2f}deg "
+                f"pelvis_delta={values['pelvis']:.2f}deg "
+                f"max_delta={delta_deg.max():.2f}deg"
+            )
+        previous_frame_local = frame_local_quats
         eulers = Rotation.from_quat(frame_local_quats).as_euler("xyz", degrees=False)
         fbx_animation[f, 3:] = eulers.flatten()
 
